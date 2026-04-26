@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Console error fixture</title>
+  </head>
+  <body>
+    <h1>This page throws on load</h1>
+    <p>Inline script triggers an uncaught TypeError.</p>
+    <script>
+      const widget = null;
+      widget.render(); // boom
+    </script>
+  </body>
+</html>

@@ -1,0 +1,23 @@
+{
+  "name": "@ubh/eval",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/runner.ts",
+  "scripts": {
+    "run": "tsx src/runner.ts",
+    "inject": "tsx src/synth/inject.ts",
+    "serve-fixtures": "tsx src/serve-fixtures.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@ubh/shared": "workspace:*",
+    "@ubh/worker": "workspace:*",
+    "playwright": "^1.44.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.5"
+  }
+}

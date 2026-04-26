@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Acme — A clean landing page</title>
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 24px; color: #1a1a1a; }
+      header { display: flex; align-items: center; gap: 12px; }
+      h1 { margin: 24px 0 8px; }
+      a { color: #1a73e8; }
+      button { padding: 10px 16px; border-radius: 6px; border: 1px solid #d0d7de; background: #f6f8fa; cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <img src="https://placehold.co/40x40/1a73e8/ffffff?text=A" alt="Acme logo" width="40" height="40" />
+      <strong>Acme</strong>
+    </header>
+    <h1>Welcome to Acme</h1>
+    <p>We help small teams move faster. <a href="#features">See features</a>.</p>
+    <button type="button" onclick="alert('hi')">Get started</button>
+
+    <h2 id="features">Features</h2>
+    <ul>
+      <li><label>Email me at <input type="email" placeholder="you@example.com" aria-label="email" /></label></li>
+      <li>Built for accessibility from day one.</li>
+      <li>No tracking scripts.</li>
+    </ul>
+
+    <footer>
+      <small>© Acme</small>
+    </footer>
+  </body>
+</html>

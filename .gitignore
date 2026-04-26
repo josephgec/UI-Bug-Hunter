@@ -1,0 +1,16 @@
+node_modules
+dist
+build
+.next
+.turbo
+*.log
+.env
+.env.local
+.DS_Store
+coverage
+.tsbuildinfo
+playwright-report
+test-results
+prisma/migrations/dev.db*
+.eval-output
+.scan-artifacts

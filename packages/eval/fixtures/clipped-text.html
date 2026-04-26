@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Clipped text fixture</title>
+    <style>
+      body { font-family: system-ui; margin: 40px; }
+      .card {
+        width: 180px;
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        padding: 16px;
+        overflow: hidden;
+      }
+      .card h2 {
+        white-space: nowrap;
+        overflow: hidden;
+        margin: 0 0 8px 0;
+        font-size: 18px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Product cards</h1>
+    <div class="card">
+      <h2>An exceptionally long product title that will not fit</h2>
+      <p>Description.</p>
+    </div>
+  </body>
+</html>
