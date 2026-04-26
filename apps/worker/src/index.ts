@@ -1,5 +1,6 @@
 import { hostname } from "node:os";
-import { ScanQueue } from "@ubh/shared";
+import { CrawlQueue, ScanQueue } from "@ubh/shared";
+import { runCrawl } from "./crawler.js";
 import { runScan } from "./runner.js";
 
 const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6379";
@@ -7,20 +8,19 @@ const CONSUMER = `${hostname()}-${process.pid}`;
 const MAX_TOOL_CALLS = Number(process.env.SCAN_MAX_TOOL_CALLS ?? "40");
 const MAX_WALL_TIME_MS = Number(process.env.SCAN_MAX_WALL_TIME_MS ?? "120000");
 
-async function main(): Promise<void> {
+let shuttingDown = false;
+function onSignal(sig: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[worker ${CONSUMER}] ${sig} received, finishing in-flight work…`);
+}
+process.on("SIGINT", () => onSignal("SIGINT"));
+process.on("SIGTERM", () => onSignal("SIGTERM"));
+
+async function consumeScans(): Promise<void> {
   const queue = ScanQueue.fromUrl(REDIS_URL);
   await queue.ensureGroup();
   console.log(`[worker ${CONSUMER}] consuming ubh:scans`);
-
-  let shuttingDown = false;
-  const onSignal = (sig: string) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    console.log(`[worker ${CONSUMER}] ${sig} received, finishing in-flight scan…`);
-  };
-  process.on("SIGINT", () => onSignal("SIGINT"));
-  process.on("SIGTERM", () => onSignal("SIGTERM"));
-
   while (!shuttingDown) {
     const queued = await queue.readOne(CONSUMER, 5000);
     if (!queued) continue;
@@ -35,8 +35,29 @@ async function main(): Promise<void> {
       await queue.ack(queued.messageId);
     }
   }
-
   await queue.close();
+}
+
+async function consumeCrawls(): Promise<void> {
+  const queue = CrawlQueue.fromUrl(REDIS_URL);
+  await queue.ensureGroup();
+  console.log(`[worker ${CONSUMER}] consuming ubh:crawls`);
+  while (!shuttingDown) {
+    const queued = await queue.readOne(CONSUMER, 5000);
+    if (!queued) continue;
+    try {
+      await runCrawl(queued.job, { redisUrl: REDIS_URL });
+    } catch (err) {
+      console.error(`[worker] crawl ${queued.job.crawlId} crashed:`, err);
+    } finally {
+      await queue.ack(queued.messageId);
+    }
+  }
+  await queue.close();
+}
+
+async function main(): Promise<void> {
+  await Promise.all([consumeScans(), consumeCrawls()]);
   console.log(`[worker ${CONSUMER}] exit`);
 }
 

@@ -6,6 +6,7 @@ export default defineConfig({
     include: [
       "packages/*/src/**/*.test.ts",
       "apps/*/src/**/*.test.ts",
+      "actions/*/src/**/*.test.ts",
       "packages/*/test/**/*.test.ts",
       "apps/*/test/**/*.test.ts",
     ],
@@ -17,6 +18,7 @@ export default defineConfig({
         "packages/shared/src/**/*.ts",
         "apps/worker/src/**/*.ts",
         "packages/eval/src/scoring.ts",
+        "actions/scan/src/format.ts",
       ],
       exclude: [
         "**/*.test.ts",
@@ -25,7 +27,9 @@ export default defineConfig({
         "apps/worker/src/index.ts",
         "apps/worker/src/runner.ts", // requires Postgres + Playwright; covered by smoke tests
         "apps/worker/src/browser.ts", // requires Playwright
+        "apps/worker/src/crawler.ts", // requires Playwright
         "apps/worker/src/deterministic/**", // requires Playwright
+        "apps/worker/src/security/credentials.ts", // requires Prisma at runtime
         "apps/worker/src/artifacts.ts", // thin disk wrapper
       ],
       thresholds: {

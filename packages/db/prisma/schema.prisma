@@ -1,7 +1,7 @@
-// UI Bug Hunter — Phase 1 schema.
-// Mirrors §7 of the design doc. Flow / multi-step support is deferred to Phase 3
-// but the relation column is left out rather than stubbed to avoid a column we
-// don't read yet.
+// UI Bug Hunter — schema (Phase 2).
+// Phase 2 additions: Crawl (multi-page), Subscription (Stripe), Credential
+// (encrypted secrets for authenticated scans), multi-viewport on Scan, plan
+// + quota fields on Organization.
 
 generator client {
   provider = "prisma-client-js"
@@ -12,14 +12,29 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model Organization {
-  id        String   @id @default(cuid())
-  name      String
-  plan      String   @default("free")
-  createdAt DateTime @default(now())
+enum Plan {
+  free
+  team
+  business
+  enterprise
+}
 
-  projects Project[]
-  users    User[]
+model Organization {
+  id                 String    @id @default(cuid())
+  name               String
+  plan               Plan      @default(free)
+  stripeCustomerId   String?   @unique
+  // Quota: number of scan-units (page × viewport) consumed in the current
+  // billing period. Reset by the Stripe webhook on invoice.created, or by a
+  // monthly cron in dev.
+  quotaUsed          Int       @default(0)
+  quotaLimit         Int       @default(25)
+  quotaResetAt      DateTime  @default(now())
+  createdAt          DateTime  @default(now())
+
+  projects     Project[]
+  users        User[]
+  subscription Subscription?
 }
 
 model User {
@@ -30,7 +45,22 @@ model User {
   org   Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
   feedback  Feedback[]
+  apiTokens ApiToken[]
   createdAt DateTime   @default(now())
+}
+
+model ApiToken {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // sha256 of the raw token; raw token shown to user once on creation.
+  tokenHash String   @unique
+  name      String
+  lastUsedAt DateTime?
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
 }
 
 model Project {
@@ -42,7 +72,9 @@ model Project {
   viewports String[] @default(["desktop"])
   createdAt DateTime @default(now())
 
-  scans Scan[]
+  scans       Scan[]
+  crawls      Crawl[]
+  credentials Credential[]
 
   @@index([orgId])
 }
@@ -54,23 +86,58 @@ enum ScanStatus {
   FAILED
 }
 
-model Scan {
-  id           String     @id @default(cuid())
-  projectId    String
-  project      Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  status       ScanStatus @default(QUEUED)
-  targetUrl    String
-  viewport     String     @default("desktop")
-  startedAt    DateTime?
-  finishedAt   DateTime?
-  costCents    Int        @default(0)
-  toolCalls    Int        @default(0)
+enum CrawlStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+model Crawl {
+  id          String      @id @default(cuid())
+  projectId   String
+  project     Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  seedUrl     String
+  maxDepth    Int         @default(2)
+  maxPages    Int         @default(25)
+  viewports   String[]    @default(["desktop"])
+  status      CrawlStatus @default(QUEUED)
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  pagesScanned Int        @default(0)
   errorMessage String?
-  createdAt    DateTime   @default(now())
+  createdAt   DateTime    @default(now())
+
+  scans Scan[]
+
+  @@index([projectId, status])
+}
+
+model Scan {
+  id            String     @id @default(cuid())
+  projectId     String
+  project       Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  crawlId       String?
+  crawl         Crawl?     @relation(fields: [crawlId], references: [id], onDelete: SetNull)
+  parentScanId  String?
+  depth         Int        @default(0)
+  status        ScanStatus @default(QUEUED)
+  targetUrl     String
+  viewports     String[]   @default(["desktop"])
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  costCents     Int        @default(0)
+  toolCalls     Int        @default(0)
+  errorMessage  String?
+  // Stable hash of (sorted viewports + url) used for crawl-level dedup of
+  // identical pages reached via different links.
+  fingerprint   String?
+  createdAt     DateTime   @default(now())
 
   findings Finding[]
 
   @@index([projectId, status])
+  @@index([crawlId])
   @@index([status, createdAt])
 }
 
@@ -88,12 +155,16 @@ model Finding {
   domSnippet        String?
   reproductionSteps String[] @default([])
   status            String   @default("open")
+  // Used to dedup the same logical bug across pages/viewports of one crawl.
+  // Computed as sha256(category + normalized(title) + normalized(domSnippet)).
+  dedupHash         String?
   createdAt         DateTime @default(now())
 
   feedback Feedback[]
 
   @@index([scanId])
   @@index([scanId, category])
+  @@index([dedupHash])
 }
 
 model Feedback {
@@ -108,4 +179,45 @@ model Feedback {
 
   @@index([findingId])
   @@index([userId])
+}
+
+enum CredentialKind {
+  HEADER
+  COOKIE
+  BASIC_AUTH
+}
+
+model Credential {
+  id         String         @id @default(cuid())
+  projectId  String
+  project    Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name       String
+  kind       CredentialKind
+  // KMS-encrypted ciphertext (AES-GCM). Plaintext shape depends on kind:
+  // HEADER: { name, value }; COOKIE: { name, value, domain }; BASIC_AUTH: { username, password }.
+  ciphertext Bytes
+  // The KMS provider's identifier for the key used to encrypt — lets us
+  // rotate without re-reading every credential.
+  keyId      String
+  // 12-byte AES-GCM IV stored alongside; auth tag is appended to ciphertext.
+  iv         Bytes
+  createdAt  DateTime       @default(now())
+  lastUsedAt DateTime?
+
+  @@unique([projectId, name])
+  @@index([projectId])
+}
+
+model Subscription {
+  id                   String   @id @default(cuid())
+  orgId                String   @unique
+  org                  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  stripeSubscriptionId String   @unique
+  stripePriceId        String
+  status               String   // active, past_due, canceled, trialing, ...
+  currentPeriodStart   DateTime
+  currentPeriodEnd     DateTime
+  cancelAt             DateTime?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
 }

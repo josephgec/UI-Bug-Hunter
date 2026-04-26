@@ -36,8 +36,8 @@ export default async function ScanPage({ params }: { params: { id: string } }) {
       </Link>
       <h1 style={{ marginBottom: 4, wordBreak: "break-all" }}>{scan.targetUrl}</h1>
       <p style={{ color: "#9aa0a6", marginTop: 0 }}>
-        Status: <strong>{scan.status}</strong> · Viewport: {scan.viewport} · Tool
-        calls: {scan.toolCalls}
+        Status: <strong>{scan.status}</strong> · Viewports:{" "}
+        {scan.viewports.join(", ")} · Tool calls: {scan.toolCalls}
         {scan.errorMessage && (
           <span style={{ color: "#f28b82", marginLeft: 12 }}>
             error: {scan.errorMessage}

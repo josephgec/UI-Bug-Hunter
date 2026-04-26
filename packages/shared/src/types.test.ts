@@ -66,13 +66,15 @@ describe("type schemas", () => {
   });
 
   describe("ScanJobSchema", () => {
-    it("defaults viewport to desktop", () => {
+    it("defaults viewports to [desktop]", () => {
       const r = ScanJobSchema.parse({
         scanId: "s1",
         projectId: "p1",
         url: "https://example.com",
       });
-      expect(r.viewport).toBe("desktop");
+      expect(r.viewports).toEqual(["desktop"]);
+      expect(r.credentialIds).toEqual([]);
+      expect(r.depth).toBe(0);
     });
     it("rejects non-URL", () => {
       expect(() =>

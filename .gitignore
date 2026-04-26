@@ -1,6 +1,10 @@
 node_modules
 dist
 build
+# GitHub Actions require the bundled dist/ to be tracked so they can run
+# directly from this repo. Override the blanket ignore above.
+!actions/*/dist
+!actions/*/dist/**
 .next
 .turbo
 *.log

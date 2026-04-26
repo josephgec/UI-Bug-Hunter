@@ -1,57 +1,62 @@
 import { Redis } from "ioredis";
-import type { ScanJob } from "./types.js";
-import { ScanJobSchema } from "./types.js";
+import { z } from "zod";
+import {
+  CrawlJobSchema,
+  ScanJobSchema,
+  type CrawlJob,
+  type ScanJob,
+} from "./types.js";
 
 export const SCAN_STREAM = "ubh:scans";
+export const CRAWL_STREAM = "ubh:crawls";
 export const SCAN_GROUP = "workers";
+export const CRAWL_GROUP = "crawlers";
 
 export interface QueuedScan {
   messageId: string;
   job: ScanJob;
 }
 
-export class ScanQueue {
-  constructor(private readonly redis: Redis) {}
+export interface QueuedCrawl {
+  messageId: string;
+  job: CrawlJob;
+}
 
-  static fromUrl(url: string): ScanQueue {
-    return new ScanQueue(new Redis(url, { maxRetriesPerRequest: null }));
-  }
+// Generic streams queue that all of our worker queues compose with.
+class StreamQueue<T> {
+  constructor(
+    protected readonly redis: Redis,
+    private readonly stream: string,
+    private readonly group: string,
+    private readonly schema: z.ZodType<T>,
+  ) {}
 
   async ensureGroup(): Promise<void> {
     try {
-      await this.redis.xgroup("CREATE", SCAN_STREAM, SCAN_GROUP, "$", "MKSTREAM");
+      await this.redis.xgroup("CREATE", this.stream, this.group, "$", "MKSTREAM");
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (!message.includes("BUSYGROUP")) throw err;
     }
   }
 
-  async enqueue(job: ScanJob): Promise<string> {
-    const id = await this.redis.xadd(
-      SCAN_STREAM,
-      "*",
-      "payload",
-      JSON.stringify(job),
-    );
+  async enqueue(job: T): Promise<string> {
+    const id = await this.redis.xadd(this.stream, "*", "payload", JSON.stringify(job));
     if (!id) throw new Error("xadd returned null id");
     return id;
   }
 
-  /**
-   * Block-read a single job for the given consumer. Returns null on timeout.
-   * Caller is responsible for calling ack() once the job is durably processed.
-   */
-  async readOne(consumer: string, blockMs = 5000): Promise<QueuedScan | null> {
+  async readOne(consumer: string, blockMs = 5000): Promise<{ messageId: string; job: T } | null> {
     const result = (await this.redis.xreadgroup(
       "GROUP",
-      SCAN_GROUP,
+      this.group,
       consumer,
       "COUNT",
       1,
       "BLOCK",
       blockMs,
       "STREAMS",
-      SCAN_STREAM,
+      this.stream,
       ">",
     )) as [string, [string, string[]][]][] | null;
 
@@ -66,7 +71,6 @@ export class ScanQueue {
 
     const payloadIdx = fields.indexOf("payload");
     if (payloadIdx === -1 || payloadIdx === fields.length - 1) {
-      // Malformed entry — ack to prevent a hot loop, swallow.
       await this.ack(messageId);
       return null;
     }
@@ -82,7 +86,7 @@ export class ScanQueue {
       await this.ack(messageId);
       return null;
     }
-    const job = ScanJobSchema.safeParse(parsed);
+    const job = this.schema.safeParse(parsed);
     if (!job.success) {
       await this.ack(messageId);
       return null;
@@ -91,10 +95,28 @@ export class ScanQueue {
   }
 
   async ack(messageId: string): Promise<void> {
-    await this.redis.xack(SCAN_STREAM, SCAN_GROUP, messageId);
+    await this.redis.xack(this.stream, this.group, messageId);
   }
 
   async close(): Promise<void> {
     await this.redis.quit();
+  }
+}
+
+export class ScanQueue extends StreamQueue<ScanJob> {
+  constructor(redis: Redis) {
+    super(redis, SCAN_STREAM, SCAN_GROUP, ScanJobSchema);
+  }
+  static fromUrl(url: string): ScanQueue {
+    return new ScanQueue(new Redis(url, { maxRetriesPerRequest: null }));
+  }
+}
+
+export class CrawlQueue extends StreamQueue<CrawlJob> {
+  constructor(redis: Redis) {
+    super(redis, CRAWL_STREAM, CRAWL_GROUP, CrawlJobSchema);
+  }
+  static fromUrl(url: string): CrawlQueue {
+    return new CrawlQueue(new Redis(url, { maxRetriesPerRequest: null }));
   }
 }

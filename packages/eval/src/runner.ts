@@ -54,13 +54,14 @@ async function main(): Promise<void> {
 async function runOne(
   url: string,
 ): Promise<{ category: BugCategory; confidence: number }[]> {
-  const session = new BrowserSession("desktop");
+  const session = new BrowserSession(["desktop"]);
   try {
-    const page = await session.start();
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
-    await session.settle();
-    const deterministic = await runDeterministicChecks(session);
-    const initialPng = await page.screenshot({ fullPage: false, type: "png" });
+    await session.start();
+    await session.gotoAll(url);
+    await session.settleAll();
+    const deterministic = await runDeterministicChecks(session, new URL(url).origin);
+    const screenshots = await session.screenshotAll();
+    const initialPng = screenshots.get("desktop")!;
 
     const tools = buildToolRegistry(session);
     const provider = createProvider();
@@ -74,7 +75,7 @@ async function runOne(
           type: "text",
           text: SCAN_INITIAL_USER_MESSAGE({
             url,
-            viewport: "desktop",
+            viewports: ["desktop"],
             deterministic: formatDeterministicForPrompt(deterministic),
           }),
         },

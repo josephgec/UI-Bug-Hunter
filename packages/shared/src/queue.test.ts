@@ -98,7 +98,9 @@ describe("ScanQueue", () => {
       scanId: "scan_1",
       projectId: "proj_1",
       url: "https://example.com",
-      viewport: "desktop",
+      viewports: ["desktop"],
+      depth: 0,
+      credentialIds: [],
     };
     await queue.enqueue(job);
     const got = await queue.readOne("test-consumer", 100);
@@ -118,7 +120,9 @@ describe("ScanQueue", () => {
       scanId: "scan_2",
       projectId: "proj_2",
       url: "https://example.com",
-      viewport: "desktop",
+      viewports: ["desktop"],
+      depth: 0,
+      credentialIds: [],
     });
     const got = await queue.readOne("test-consumer", 100);
     expect(got).not.toBeNull();

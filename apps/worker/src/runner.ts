@@ -1,5 +1,10 @@
 import { prisma, ScanStatus } from "@ubh/db";
-import type { ScanJob } from "@ubh/shared";
+import {
+  findingDedupHash,
+  scanFingerprint,
+  type ScanJob,
+  type Viewport,
+} from "@ubh/shared";
 import { runAgentLoop } from "./agent/loop.js";
 import { createProvider } from "./agent/providers/index.js";
 import {
@@ -13,6 +18,7 @@ import {
   formatDeterministicForPrompt,
   runDeterministicChecks,
 } from "./deterministic/index.js";
+import { loadAuthInjection } from "./security/credentials.js";
 import { buildToolRegistry } from "./tools/index.js";
 
 interface RunnerConfig {
@@ -27,31 +33,46 @@ export async function runScan(job: ScanJob, config: RunnerConfig): Promise<void>
   });
 
   const artifacts = ArtifactStore.fromEnv();
-  const session = new BrowserSession(job.viewport);
+  const auth = await loadAuthInjection(job.credentialIds);
+  const session = new BrowserSession(job.viewports as Viewport[], auth);
   const startedAt = Date.now();
 
   try {
-    const page = await session.start();
-    await page.goto(job.url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await session.settle();
+    await session.start();
+    await session.gotoAll(job.url);
+    await session.settleAll();
 
-    const deterministic = await runDeterministicChecks(session);
+    const origin = new URL(job.url).origin;
+    const deterministic = await runDeterministicChecks(session, origin);
 
-    // Initial screenshot (also fed into the agent's first turn).
-    const initialPng = await page.screenshot({ fullPage: false, type: "png" });
-    const initialUrl = await artifacts.writePng(job.scanId, "initial", initialPng);
-
-    const initialUser: LLMUserContentBlock[] = [
+    // One screenshot per viewport — all attached to the agent's first turn so
+    // it can reason across breakpoints in a single LLM call.
+    const screenshots = await session.screenshotAll();
+    const initialContent: LLMUserContentBlock[] = [
       {
         type: "text",
         text: SCAN_INITIAL_USER_MESSAGE({
           url: job.url,
-          viewport: job.viewport,
+          viewports: job.viewports as string[],
           deterministic: formatDeterministicForPrompt(deterministic),
         }),
       },
-      { type: "image", mediaType: "image/png", data: initialPng.toString("base64") },
     ];
+    for (const viewport of job.viewports as Viewport[]) {
+      const buf = screenshots.get(viewport);
+      if (!buf) continue;
+      // Persist alongside the scan for the dashboard to render.
+      await artifacts.writePng(job.scanId, `initial-${viewport}`, buf);
+      initialContent.push({
+        type: "text",
+        text: `(${viewport})`,
+      });
+      initialContent.push({
+        type: "image",
+        mediaType: "image/png",
+        data: buf.toString("base64"),
+      });
+    }
 
     const tools = buildToolRegistry(session);
     const provider = createProvider();
@@ -60,26 +81,42 @@ export async function runScan(job: ScanJob, config: RunnerConfig): Promise<void>
       provider,
       tools,
       systemPrompt: SCAN_SYSTEM_PROMPT,
-      initialUserMessage: initialUser,
+      initialUserMessage: initialContent,
       budget: {
         maxToolCalls: config.maxToolCalls,
         maxWallTimeMs: config.maxWallTimeMs,
       },
       onTrace: (e) => {
-        // Lightweight logging — wire to OpenTelemetry once §16 of the design
-        // doc gets serious about observability.
         if (process.env.WORKER_TRACE === "1") {
           console.log(JSON.stringify({ scan: job.scanId, ...e }));
         }
       },
     });
 
-    // Persist findings + a baseline finding for any deterministic check that
-    // the agent didn't echo. The agent is supposed to use deterministic
-    // results as evidence, but we still want the raw data to be visible if
-    // the model decides to skip them.
+    // Crawl-level dedup: if this scan is part of a crawl, look up findings
+    // already reported in sibling scans by their dedupHash and skip dupes.
+    let existingHashes = new Set<string>();
+    if (job.crawlId) {
+      const dupes = await prisma.finding.findMany({
+        where: { scan: { crawlId: job.crawlId } },
+        select: { dedupHash: true },
+      });
+      existingHashes = new Set(dupes.map((d) => d.dedupHash).filter((h): h is string => !!h));
+    }
+
+    const findingRows = session.reportedBugs
+      .map((bug) => ({
+        ...bug,
+        dedupHash: findingDedupHash({
+          category: bug.category as never,
+          title: bug.title,
+          domSnippet: bug.domSnippet ?? null,
+        }),
+      }))
+      .filter((bug) => !existingHashes.has(bug.dedupHash));
+
     await prisma.$transaction([
-      ...session.reportedBugs.map((bug) =>
+      ...findingRows.map((bug) =>
         prisma.finding.create({
           data: {
             scanId: job.scanId,
@@ -88,10 +125,11 @@ export async function runScan(job: ScanJob, config: RunnerConfig): Promise<void>
             confidence: bug.confidence,
             title: bug.title,
             description: bug.description,
-            screenshotUrl: bug.evidenceScreenshotPath ?? initialUrl,
+            screenshotUrl: bug.evidenceScreenshotPath ?? null,
             ...(bug.bbox ? { bbox: bug.bbox } : {}),
             ...(bug.domSnippet !== undefined ? { domSnippet: bug.domSnippet } : {}),
             reproductionSteps: bug.reproductionSteps,
+            dedupHash: bug.dedupHash,
           },
         }),
       ),
@@ -101,12 +139,13 @@ export async function runScan(job: ScanJob, config: RunnerConfig): Promise<void>
           status: ScanStatus.COMPLETED,
           finishedAt: new Date(),
           toolCalls: result.toolCalls,
+          fingerprint: scanFingerprint(job.url, job.viewports),
         },
       }),
     ]);
 
     console.log(
-      `[scan ${job.scanId}] done in ${Date.now() - startedAt}ms — ${session.reportedBugs.length} findings, ${result.toolCalls} tool calls (${result.endedReason})`,
+      `[scan ${job.scanId}] done in ${Date.now() - startedAt}ms — ${findingRows.length} findings (${session.reportedBugs.length - findingRows.length} dedup'd), ${result.toolCalls} tool calls (${result.endedReason})`,
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

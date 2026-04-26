@@ -9,14 +9,16 @@ import {
   validateScanUrl,
 } from "@ubh/shared";
 import { authenticate, unauthorized } from "@/auth";
-import { getQueue } from "@/queue-client";
+import { getCrawlQueue } from "@/queue-client";
 
 export const runtime = "nodejs";
 
 const Body = z.object({
   projectId: z.string().min(1),
-  url: z.string().url(),
+  seedUrl: z.string().url(),
   viewports: z.array(z.enum(VIEWPORTS)).min(1).max(3).optional(),
+  maxDepth: z.number().int().min(0).max(5).optional(),
+  maxPages: z.number().int().min(1).max(200).optional(),
   credentialIds: z.array(z.string()).optional(),
 });
 
@@ -41,11 +43,9 @@ export async function POST(req: Request) {
   const project = await prisma.project.findFirst({
     where: { id: parsed.data.projectId, orgId: user.orgId },
   });
-  if (!project) {
-    return NextResponse.json({ error: "project_not_found" }, { status: 404 });
-  }
+  if (!project) return NextResponse.json({ error: "project_not_found" }, { status: 404 });
 
-  const validation = await validateScanUrl(parsed.data.url);
+  const validation = await validateScanUrl(parsed.data.seedUrl);
   if (!validation.ok) {
     return NextResponse.json(
       { error: "url_rejected", reason: validation.reason, detail: validation.detail },
@@ -54,13 +54,12 @@ export async function POST(req: Request) {
   }
 
   const viewports = parsed.data.viewports ?? ["desktop"];
+  const maxPages = parsed.data.maxPages ?? 25;
+  const maxDepth = parsed.data.maxDepth ?? 2;
   const credentialIds = parsed.data.credentialIds ?? [];
 
-  const org = await prisma.organization.findUniqueOrThrow({
-    where: { id: user.orgId },
-  });
+  const org = await prisma.organization.findUniqueOrThrow({ where: { id: user.orgId } });
 
-  // Plan gate: authenticated scans require a paid plan.
   if (credentialIds.length > 0 && !PLAN_LIMITS[org.plan].allowAuthenticatedScans) {
     return NextResponse.json(
       { error: "plan_required", detail: "authenticated scans require Team or higher" },
@@ -68,8 +67,8 @@ export async function POST(req: Request) {
     );
   }
 
-  // Quota check.
-  const units = scanUnitsFor({ pages: 1, viewports: viewports.length });
+  // Worst-case unit count: pages × viewports.
+  const units = scanUnitsFor({ pages: maxPages, viewports: viewports.length });
   const quota = checkQuota({
     plan: org.plan,
     quotaUsed: org.quotaUsed,
@@ -78,53 +77,39 @@ export async function POST(req: Request) {
   });
   if (!quota.ok && quota.reason !== "overage") {
     return NextResponse.json(
-      { error: "quota_exceeded", reason: quota.reason, remaining: quota.remaining },
+      { error: "quota_exceeded", reason: quota.reason, remaining: quota.remaining, units },
       { status: 402 },
     );
   }
 
-  // Create row, enqueue job, increment usage.
-  const scan = await prisma.scan.create({
+  const crawl = await prisma.crawl.create({
     data: {
       projectId: project.id,
-      targetUrl: validation.url.toString(),
+      seedUrl: validation.url.toString(),
       viewports,
+      maxDepth,
+      maxPages,
     },
   });
-  await prisma.organization.update({
-    where: { id: org.id },
-    data: { quotaUsed: { increment: units } },
-  });
 
-  // If overage was incurred, report to billing provider (best-effort).
-  if (!quota.ok && quota.reason === "overage") {
-    try {
-      const { getBilling } = await import("@/billing/provider");
-      await getBilling().reportOverage(org.id, quota.overageUnits);
-    } catch (err) {
-      console.error("[billing] reportOverage failed:", err);
-    }
-  }
+  // We don't increment the org's quota here — the per-scan endpoint does that
+  // as each page-scan is created. Otherwise we'd double-count if the crawl
+  // discovers fewer pages than maxPages.
 
-  const queue = getQueue();
+  const queue = getCrawlQueue();
   await queue.ensureGroup();
   await queue.enqueue({
-    scanId: scan.id,
+    crawlId: crawl.id,
     projectId: project.id,
-    url: scan.targetUrl,
+    seedUrl: crawl.seedUrl,
+    maxDepth,
+    maxPages,
     viewports,
     credentialIds,
-    depth: 0,
   });
 
   return NextResponse.json(
-    {
-      scanId: scan.id,
-      status: "queued",
-      unitsConsumed: units,
-      ...(quota.ok ? { quotaRemaining: quota.remaining } : {}),
-      ...(quota.ok ? {} : { overageUnits: (quota as { overageUnits: number }).overageUnits ?? 0 }),
-    },
+    { crawlId: crawl.id, status: "queued", maxUnits: units },
     { status: 202 },
   );
 }

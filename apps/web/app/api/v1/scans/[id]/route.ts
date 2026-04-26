@@ -21,7 +21,7 @@ export async function GET(
     id: scan.id,
     status: scan.status,
     targetUrl: scan.targetUrl,
-    viewport: scan.viewport,
+    viewports: scan.viewports,
     startedAt: scan.startedAt,
     finishedAt: scan.finishedAt,
     findingsCount: scan._count.findings,

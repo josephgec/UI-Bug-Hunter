@@ -1,0 +1,55 @@
+name: "UI Bug Hunter"
+description: "Scan a URL with UI Bug Hunter and gate the build on findings."
+branding:
+  icon: "alert-triangle"
+  color: "purple"
+inputs:
+  api-url:
+    description: "Base URL of the UI Bug Hunter API. Defaults to https://api.uibughunter.dev."
+    required: false
+    default: "https://api.uibughunter.dev"
+  api-token:
+    description: "API token (Personal Access Token) for authentication."
+    required: true
+  project-id:
+    description: "UI Bug Hunter project ID to attach scans to."
+    required: true
+  urls:
+    description: "Newline-separated list of URLs to scan. Each URL becomes one scan."
+    required: true
+  viewports:
+    description: "Comma-separated viewports to render: mobile,tablet,desktop. Default: desktop."
+    required: false
+    default: "desktop"
+  severity-threshold:
+    description: "Fail the job if any finding meets or exceeds this severity (critical, high, medium, low). Default: high."
+    required: false
+    default: "high"
+  min-confidence:
+    description: "Minimum confidence (0-1) for a finding to count toward the gate. Default: 0.6."
+    required: false
+    default: "0.6"
+  poll-timeout-seconds:
+    description: "Maximum seconds to wait per scan before treating it as timed out."
+    required: false
+    default: "300"
+  comment-on-pr:
+    description: "Post a summary comment on the PR (true/false). Default: true."
+    required: false
+    default: "true"
+  credential-ids:
+    description: "Comma-separated credential IDs to inject (header/cookie/basic-auth). Project-scoped."
+    required: false
+    default: ""
+  overage-behavior:
+    description: "What to do if the API returns 402 quota_exceeded: hard-fail, soft-fail, continue. Default: hard-fail."
+    required: false
+    default: "hard-fail"
+outputs:
+  scan-ids:
+    description: "Comma-separated scan IDs created."
+  failed-findings:
+    description: "Number of findings at or above the severity threshold."
+runs:
+  using: "node20"
+  main: "dist/index.js"

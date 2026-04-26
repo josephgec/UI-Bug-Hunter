@@ -43,15 +43,11 @@ const gotoTool = (session: BrowserSession): ToolHandler<unknown, unknown> =>
       const parsed = GotoInput.parse(raw);
       const validation = await validateScanUrl(parsed.url);
       if (!validation.ok) return { ok: false, error: `url_rejected:${validation.reason}` };
+      // Navigate every viewport so subsequent screenshots stay aligned.
+      await session.gotoAll(validation.url.toString());
+      await session.settleAll();
       const page = session.requirePage();
-      const response = await page.goto(validation.url.toString(), { waitUntil: "domcontentloaded" });
-      await session.settle();
-      const result: { ok: boolean; status?: number; finalUrl?: string } = {
-        ok: true,
-        finalUrl: page.url(),
-      };
-      if (response) result.status = response.status();
-      return result;
+      return { ok: true, finalUrl: page.url() };
     },
     formatResult(out) {
       return textOnly(JSON.stringify(out));
@@ -82,18 +78,15 @@ const screenshotTool = (session: BrowserSession): ToolHandler<unknown, unknown> 
     },
     async execute(raw) {
       const parsed = ScreenshotInput.parse(raw ?? {});
-      const page = session.requirePage();
-      const { stable } = await session.settle();
-      // We don't actually re-create the browser context for a different viewport
-      // mid-scan in v1 — that's a separate scan. We honor the input by using
-      // page.setViewportSize for visual diversity but keep the device profile.
+      // If the agent doesn't specify, screenshot the primary viewport.
+      const viewport = parsed.viewport ?? session.primaryViewport;
+      const page = session.pageFor(viewport);
+      const { stable } = await session.settle(viewport);
       const buf = await page.screenshot({ fullPage: parsed.fullPage ?? false, type: "png" });
-      // Cap image size to keep the LLM bill bounded; 1024px wide is enough for
-      // the visual judgement the agent needs.
       const downsampled = await downsampleIfNeeded(buf);
       return {
         dataBase64: downsampled.toString("base64"),
-        viewport: parsed.viewport ?? session.viewport,
+        viewport,
         stable,
       };
     },
@@ -328,6 +321,7 @@ const ReportBugInput = z.object({
   description: z.string().min(1).max(2000),
   domSnippet: z.string().max(4000).optional(),
   reproductionSteps: z.array(z.string()).optional(),
+  affectedViewports: z.array(z.enum(VIEWPORTS)).optional(),
   bbox: z
     .object({
       x: z.number(),
@@ -354,6 +348,10 @@ const reportBugTool = (session: BrowserSession): ToolHandler<unknown, unknown> =
           description: { type: "string", minLength: 1, maxLength: 2000 },
           domSnippet: { type: "string", maxLength: 4000 },
           reproductionSteps: { type: "array", items: { type: "string" } },
+          affectedViewports: {
+            type: "array",
+            items: { type: "string", enum: [...VIEWPORTS] },
+          },
           bbox: {
             type: "object",
             properties: {
@@ -379,6 +377,7 @@ const reportBugTool = (session: BrowserSession): ToolHandler<unknown, unknown> =
         title: parsed.title,
         description: parsed.description,
         reproductionSteps: parsed.reproductionSteps ?? [],
+        affectedViewports: (parsed.affectedViewports ?? []) as Viewport[],
         ...(parsed.domSnippet !== undefined ? { domSnippet: parsed.domSnippet } : {}),
         ...(parsed.bbox !== undefined ? { bbox: parsed.bbox } : {}),
       };

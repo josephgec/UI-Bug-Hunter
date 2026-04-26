@@ -3,14 +3,15 @@
 AI agent that drives a headless browser, captures multimodal evidence (screenshots, DOM,
 console logs, network activity), and reports a categorized list of UI bugs found on a page.
 
-This repository is a **Phase 1 MVP scaffold** — a runnable local prototype that exercises
-the architecture end-to-end. Production-shaped infrastructure (Firecracker microVMs,
-deployed staging, real eval set, two-pass adversarial verification) is planned for
-Phase 1 weeks 2, 4, 5, and 6 and is intentionally not yet wired here.
+This repository tracks the design doc's phased rollout. **Phase 1 (MVP)** stood up the agent
+loop, schema, queue, deterministic checks, and eval harness. **Phase 2 (Beta — in progress)**
+layers on multi-viewport rendering, multi-page crawling, the full bug taxonomy, billing,
+encrypted credentials for authenticated scans, and a GitHub Action.
 
-See the project design doc for the full plan: components, taxonomy, agent loop,
-false-positive controls, security model, cost envelope, pricing, eval methodology,
-and phased rollout.
+Items planned for Phase 2 that need infrastructure I don't have access to in this codebase
+(live Stripe, real KMS, deployed staging, marketing site, status page, real load test at
+100 concurrent scans) are abstracted behind interfaces with mock implementations — production
+swaps the implementation without touching callers.
 
 ---
 
@@ -19,29 +20,36 @@ and phased rollout.
 ```
 apps/
   web/           Next.js (App Router) dashboard + REST API
-  worker/        Queue consumer, Playwright browser session, agent loop
+  worker/        Queue consumer, Playwright multi-viewport sessions, agent loop
 packages/
-  db/            Prisma schema + client (Postgres)
-  shared/        Cross-package types, Redis Streams queue wrapper, URL validator
-  eval/          Eval harness, fixture pages, synthetic bug injection, scoring
+  db/            Prisma schema (Postgres) + client
+  shared/        Cross-package types, queue, URL validator, KMS, billing, dedup, crawl
+  eval/          Eval harness, fixtures, synthetic injection, scoring
+actions/
+  scan/          GitHub Action that submits scans + posts a PR comment
 ```
 
-**Request lifecycle**
+**Request lifecycle (Phase 2)**
 
-1. Client `POST`s `/api/v1/scans` with a project ID + URL.
+1. Client `POST`s `/api/v1/scans` (single-page) or `/api/v1/crawls` (multi-page).
 2. Web app validates the URL (rejects RFC1918, link-local, cloud metadata, non-HTTP),
-   creates a `Scan` row, and pushes a job onto the Redis Streams queue `ubh:scans`.
-3. A worker dequeues the job, opens a Playwright browser, navigates to the URL,
-   waits for `networkidle`, disables animations, and runs deterministic checks
-   (axe-core, broken-image detector, console capture).
-4. The worker hands the deterministic results + an initial screenshot to the LLM
-   agent, which drives the browser through a constrained tool surface (`goto`,
-   `screenshot`, `get_dom`, `get_console_logs`, `get_network_errors`, `click`,
-   `type`, `scroll`, `check_accessibility`, `report_bug`).
-5. The agent loop runs until the model emits a turn with no tool calls, the tool-call
-   budget is exhausted, or the wall-time budget is exhausted.
-6. Reported findings are persisted to Postgres; the dashboard renders findings
-   above a 0.6 confidence threshold (lower-confidence findings are hidden by default).
+   enforces the org's plan + quota, creates a `Scan` (or `Crawl`) row, and pushes a job
+   onto Redis Streams (`ubh:scans` / `ubh:crawls`).
+3. **Crawler worker** (for multi-page) discovers same-origin links from the seed page,
+   enforces depth + page caps, and enqueues a `Scan` job per page.
+4. **Scan worker** spins up a Playwright browser with one BrowserContext per viewport,
+   navigates all viewports in parallel, waits for `networkidle`, disables animations,
+   exercises lazy-loaded content, runs the deterministic checks (axe-core, broken images,
+   dead links, console capture, content-issue regex), and hands the results + a screenshot
+   per viewport to the agent in a single LLM turn.
+5. The agent drives the browser through a constrained tool surface (`goto`, `screenshot`
+   per viewport, `get_dom`, `get_console_logs`, `get_network_errors`, `click`, `type`,
+   `scroll`, `check_accessibility`, `report_bug`).
+6. Findings are dedup-hashed (sha256 prefix of normalized title + DOM snippet + category)
+   and persisted; the runner skips findings whose hash already exists in a sibling scan
+   of the same crawl.
+7. The dashboard renders findings ≥0.6 confidence by default; the GitHub Action exits
+   non-zero if any finding meets the configured severity threshold.
 
 **LLM provider abstraction.** The agent loop talks through a provider-agnostic
 interface (`apps/worker/src/agent/llm.ts`). Three implementations ship:
@@ -52,36 +60,36 @@ interface (`apps/worker/src/agent/llm.ts`). Three implementations ship:
 
 Switch with `LLM_PROVIDER=mock|anthropic|openai` and the matching API key.
 
+**KMS abstraction.** Credential vault uses `LocalKmsProvider` (AES-256-GCM with a key
+derived from `KMS_LOCAL_KEY`) by default; an `AwsKmsProvider` stub is wired to the same
+interface. Plaintext credentials never leave the worker's decrypt-then-inject stack —
+they are never logged, never persisted in plaintext, and never sent to the LLM.
+
+**Billing abstraction.** `MockBillingProvider` for dev, `StripeBillingProvider` skeleton
+for prod. Quota enforcement against `Organization.quotaUsed` / `quotaLimit` is provider-
+agnostic; only checkout / portal / webhook calls touch Stripe.
+
 ---
 
 ## Quick start
 
-Prereqs: Node 20+, pnpm 9+, Docker, and a willingness to install Chromium (~150 MB).
+Prereqs: Node 20+, pnpm 9+, Docker, ~150 MB for Chromium.
 
 ```bash
-# 1. Install dependencies
 corepack enable pnpm
 pnpm install
-
-# 2. Bring up Postgres + Redis
 cp .env.example .env
-docker compose up -d
 
-# 3. Apply the schema
-pnpm db:migrate
-
-# 4. Install Playwright's Chromium
+docker compose up -d            # postgres + redis
+pnpm db:migrate                 # apply schema
 pnpm --filter @ubh/worker exec playwright install chromium
 
-# 5. Start the web app and worker (two terminals)
+# Two terminals:
 pnpm web:dev      # http://localhost:3000
-pnpm worker:dev
+pnpm worker:dev   # consumes both ubh:scans and ubh:crawls
 ```
 
-### Submitting a scan
-
-The Phase 1 auth stub trusts the `x-dev-user` header (and falls back to `DEV_USER_EMAIL`
-in the env). On first request a User + Org are created automatically.
+### Submitting work
 
 ```bash
 # Create a project
@@ -90,75 +98,94 @@ curl -s -X POST http://localhost:3000/api/v1/projects \
   -H 'x-dev-user: dev@local.test' \
   -d '{"name":"Smoke","baseUrl":"https://example.com"}' | jq
 
-# Submit a scan
+# Single-page scan, all three viewports
 curl -s -X POST http://localhost:3000/api/v1/scans \
   -H 'content-type: application/json' \
   -H 'x-dev-user: dev@local.test' \
-  -d '{"projectId":"<id>","url":"https://example.com"}' | jq
+  -d '{
+    "projectId":"<id>",
+    "url":"https://example.com",
+    "viewports":["mobile","tablet","desktop"]
+  }' | jq
 
-# Read findings
-curl -s "http://localhost:3000/api/v1/scans/<scanId>/findings?min_confidence=0.6" \
-  -H 'x-dev-user: dev@local.test' | jq
+# Multi-page crawl (depth 2, up to 25 pages)
+curl -s -X POST http://localhost:3000/api/v1/crawls \
+  -H 'content-type: application/json' \
+  -H 'x-dev-user: dev@local.test' \
+  -d '{"projectId":"<id>","seedUrl":"https://example.com","maxDepth":2,"maxPages":25}' | jq
+
+# Authenticated scan: store a credential, then reference it
+curl -s -X POST http://localhost:3000/api/v1/projects/<projectId>/credentials \
+  -H 'content-type: application/json' \
+  -H 'x-dev-user: dev@local.test' \
+  -d '{"name":"staging-cookie","kind":"COOKIE","data":{"name":"sid","value":"abc","domain":"staging.example.com"}}' | jq
 ```
 
-The dashboard at http://localhost:3000 lists projects and renders scan results
-with bounding-box overlays where the agent provided one.
+### GitHub Action
+
+```yaml
+- uses: josephgec/UI-Bug-Hunter/actions/scan@main
+  with:
+    api-url: https://api.uibughunter.dev
+    api-token: ${{ secrets.UBH_TOKEN }}
+    project-id: ${{ vars.UBH_PROJECT_ID }}
+    urls: |
+      https://staging.example.com/
+      https://staging.example.com/checkout
+    viewports: mobile,tablet,desktop
+    severity-threshold: high
+    min-confidence: "0.7"
+    overage-behavior: hard-fail
+```
+
+Build it locally (the bundled output lives under `actions/scan/dist/`):
+
+```bash
+pnpm --filter @ubh/action-scan build
+```
 
 ---
 
 ## Testing
 
-The pure-logic surfaces (URL validator, queue, scoring, agent loop, provider
-translators, tool input parsing) ship with vitest unit tests. Integration tests
-that require a live Postgres / Redis / Chromium are intentionally not part of
-the default `test` run — they belong in CI.
-
 ```bash
-pnpm test               # vitest run
+pnpm test               # vitest run — 101 tests across 14 files
 pnpm test:watch         # vitest --watch
-pnpm test:coverage      # produces ./coverage/lcov.info + html report
+pnpm test:coverage      # v8 coverage (lines / branches / funcs / statements)
 ```
 
-Coverage thresholds are enforced at 70% lines / functions / branches / statements
-across `packages/shared`, `packages/eval/src/scoring.ts`, and the pure-logic
-modules under `apps/worker/src/agent` and `apps/worker/src/tools`. Browser-bound
-modules (`browser.ts`, `runner.ts`, `deterministic/*`) are excluded — they are
-covered by the eval harness against the local fixture server.
+Coverage gates at 70% are enforced across the pure-logic surface; the latest run
+sits at **91.4% lines / 84.3% branches / 81.8% functions**. Browser-bound modules
+(`browser.ts`, `crawler.ts`, `deterministic/*`, `runner.ts`) are excluded from
+coverage and exercised by the eval harness instead.
 
-What the tests assert today:
+What the suite covers:
 
 | File | What it covers |
 |---|---|
 | `packages/shared/src/url-validator.test.ts` | RFC1918 / link-local / metadata / IPv6 ULA / DNS-resolved private IPs / scheme allowlist |
 | `packages/shared/src/queue.test.ts` | enqueue + readOne round-trip, ack, idempotent group creation, malformed payload tolerance |
 | `packages/shared/src/types.test.ts` | Zod schemas for `ReportedBug` and `ScanJob`, including default fill-in and rejection cases |
-| `packages/eval/src/scoring.test.ts` | TP/FP/FN math, micro-aggregation across categories, edge cases (empty / clean) |
-| `apps/worker/src/agent/loop.test.ts` | Tool dispatch, missing-tool error path, exception path, tool-call budget hard-stop, wall-time hard-stop, no-tool-use early termination |
-| `apps/worker/src/agent/providers/mock.test.ts` | Scripted walk + exhaustion, unique tool-use IDs, default-script coverage |
-| `apps/worker/src/agent/providers/anthropic.test.ts` | Request translation (tools, multimodal user content, tool_result), response translation, stop-reason mapping |
-| `apps/worker/src/agent/providers/openai.test.ts` | Chat Completions translation, malformed-JSON tolerance for tool args, image follow-up after tool message, finish-reason mapping |
-| `apps/worker/src/tools/registry.test.ts` | Registry shape, schema sanity, `report_bug` validation + side effect on session buffer |
+| `packages/shared/src/crawl.test.ts` | URL normalization (fragments / trailing slash / query-param order), same-origin filter, frontier maxDepth + maxPages enforcement, dedup |
+| `packages/shared/src/dedup.test.ts` | Whitespace / case insensitivity, category-sensitive hashes, scan fingerprint stability |
+| `packages/shared/src/billing.test.ts` | Quota math: hard-cap rejection, soft-cap overage units, 80%/100% threshold crossing |
+| `packages/shared/src/kms.test.ts` | LocalKmsProvider AES-256-GCM round-trip, IV uniqueness, tamper detection, key-id rotation guard |
+| `packages/eval/src/scoring.test.ts` | TP/FP/FN math, micro-aggregation, edge cases (clean / empty) |
+| `apps/worker/src/agent/loop.test.ts` | Tool dispatch, missing-tool error path, exception path, tool-call budget hard-stop, wall-time hard-stop |
+| `apps/worker/src/agent/providers/{mock,anthropic,openai}.test.ts` | Provider translators (request + response), stop-reason mapping, malformed-JSON tolerance |
+| `apps/worker/src/tools/registry.test.ts` | Registry shape, schema sanity, `report_bug` validation + side effect |
+| `actions/scan/src/format.test.ts` | PR-comment renderer: green / red summaries, top-5 inline + collapsed-by-category for the rest, dashboard links |
 
 ### Running the eval harness
 
 ```bash
-# Terminal A — serve the fixture pages
-pnpm --filter @ubh/eval serve-fixtures
-
-# Terminal B — run the eval against the agent (uses LLM_PROVIDER from env)
-pnpm eval
+pnpm --filter @ubh/eval serve-fixtures   # http://localhost:4173
+pnpm eval                                 # writes .eval-output/report.{json,txt}
 ```
-
-The runner writes `precision/recall/F1` per bug category to `.eval-output/report.txt`
-and a JSON twin alongside. With `LLM_PROVIDER=mock` you can confirm the harness
-works without an API key (precision will be 0 because the mock doesn't actually
-report bugs — that's expected).
 
 ---
 
 ## Configuration
-
-Every knob lives in `.env` (template in `.env.example`). The notable ones:
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -167,51 +194,72 @@ Every knob lives in `.env` (template in `.env.example`). The notable ones:
 | `LLM_PROVIDER` | `mock` | `mock` / `anthropic` / `openai` |
 | `LLM_MODEL` | provider default | overrides provider's default model |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | required for non-mock providers |
+| `BILLING_PROVIDER` | `mock` | `mock` / `stripe` |
+| `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` / `STRIPE_PRICE_TEAM` / `STRIPE_PRICE_BUSINESS` | — | required when `BILLING_PROVIDER=stripe` |
+| `KMS_PROVIDER` | `local` | `local` / `aws` |
+| `KMS_LOCAL_KEY` | — | passphrase for the local AES-256-GCM provider; min 16 chars |
+| `AWS_KMS_KEY_ID` | — | required when `KMS_PROVIDER=aws` |
 | `SCAN_MAX_TOOL_CALLS` | `40` | hard stop in the agent loop |
 | `SCAN_MAX_WALL_TIME_MS` | `120000` | hard stop in the agent loop |
-| `WORKER_CONCURRENCY` | `1` | scans per worker process; v1 is one-at-a-time |
+| `WORKER_CONCURRENCY` | `1` | scans per worker process |
 | `ARTIFACT_DIR` | `./.scan-artifacts` | local-disk screenshot store |
 | `WORKER_TRACE` | unset | set to `1` to emit JSON trace events for every tool call |
 
 ---
 
-## What's wired in this scaffold
+## What's wired
 
+### Phase 1
 - Workspace, schema, queue, REST API, dashboard skeleton, worker entrypoint
-- Plan-act-observe agent loop with hard tool-call and wall-time budgets
+- Plan-act-observe agent loop with tool-call and wall-time budgets
 - Provider-agnostic LLM interface (`mock` / `anthropic` / `openai`)
-- Tool stack: `goto`, `screenshot`, `get_dom`, `get_console_logs`,
-  `get_network_errors`, `click`, `type`, `scroll`, `check_accessibility`,
-  `report_bug`
-- Deterministic checks: axe-core, broken-image detector, filtered console
-  capture; results piped into the agent's first turn so it doesn't re-derive
-- Animation kill + two-shot stability check before any visual finding
-- URL validator (private IPs, link-local, metadata IPs, non-HTTP schemes)
-- Eval harness shell with fixtures, synthetic bug injection, precision/recall/F1
-  scoring, and a local fixture HTTP server
-- vitest test suite with v8 coverage reporting
+- Deterministic checks: axe-core, broken-image detector, console capture
+- Animation kill + lazy-load + two-shot stability check
+- URL validator, eval harness, vitest suite
 
-## What's not wired yet (planned in Phase 1)
+### Phase 2
+- Multi-viewport rendering: one Playwright context per viewport, navigated in parallel,
+  all screenshots batched into the agent's first user message
+- Multi-page crawl: same-origin link discovery, BFS frontier with maxDepth/maxPages,
+  per-page Scan jobs spawned, finding dedup across the crawl via sha256 hashes
+- New deterministic checks: dead-link detector (HEAD-then-GET fallback, concurrency-
+  limited, same-origin only by default), lorem-ipsum detector, broken-templating
+  detector ({{var}} / {%var%})
+- Billing: `Plan` enum, quota fields on `Organization`, `Subscription` table,
+  `BillingProvider` interface with `MockBillingProvider` (dev) and `StripeBillingProvider`
+  (skeleton), checkout + webhook routes, quota enforcement at scan/crawl submission with
+  402 on hard-cap exceeded and overage reporting on soft-cap exceeded
+- Encrypted credentials: `Credential` table with KMS-encrypted ciphertext, `KmsProvider`
+  interface with `LocalKmsProvider` (AES-256-GCM, env-derived key) and `AwsKmsProvider`
+  skeleton, header / cookie / basic-auth shapes, plaintext lifecycle bounded to
+  `loadAuthInjection` → `BrowserSession` and never logged
+- GitHub Action: `actions/scan/` with `action.yml` + bundled `index.ts`, submits scans,
+  polls until complete, posts a PR comment grouped by severity, exits non-zero on
+  threshold-breaching findings, configurable overage behavior (hard-fail / soft-fail /
+  continue)
 
-| Week | Item |
-|---|---|
-| 2 | Firecracker microVM sandbox (worker currently runs Playwright directly) |
-| 2 | Egress proxy in front of the sandbox |
-| 4 | Full 50-page hand-curated eval set with ground-truth labels |
-| 5 | Two-pass adversarial verification of every reported finding |
-| 5 | Embedding-similarity allowlist beyond exact match |
-| 6 | Rich dashboard: bounding-box overlays, feedback rolling-up into eval, project allowlist UI |
+## What's not wired
+
+| Item | Reason | Status |
+|---|---|---|
+| Firecracker microVM sandbox | Requires production infra | Worker runs Playwright directly |
+| Real Stripe integration | Needs live keys | `BILLING_PROVIDER=mock` works end-to-end; Stripe path is wired but stubs throw without env |
+| AWS KMS | Needs AWS account | `KMS_PROVIDER=local` works end-to-end; AWS path is wired but stubs throw without env |
+| 50-page hand-curated eval set | Needs human curation | Synthetic + 7 fixtures shipped; runner ready for more |
+| Two-pass adversarial verification | Phase 2 week 5 | Confidence threshold only |
+| Marketing site, status page | Not code | n/a |
+| Load test at 100 concurrent scans | Needs cloud infra | n/a |
+| Onboarding flow tuned for first scan in 60s | Needs UX iteration | n/a |
 
 ---
 
 ## Contributing
 
-This is an internal scaffold; external contribution model is TBD. While it's a
-moving target:
-
 - Run `pnpm typecheck && pnpm test` before committing.
-- The bug taxonomy in `packages/shared/src/types.ts` is the source of truth — if
-  you rename a category, update the system prompt in `apps/worker/src/agent/prompts.ts`
+- The bug taxonomy in `packages/shared/src/types.ts` is the source of truth — if you
+  rename a category, update the system prompt in `apps/worker/src/agent/prompts.ts`
   in the same change.
-- Keep `LLM_PROVIDER=mock` working: it's the contract the agent loop unit tests
-  rely on and how new contributors verify the wiring without burning API credits.
+- Keep `LLM_PROVIDER=mock` working: it's the contract the agent loop tests rely on.
+- New deterministic checks belong in `apps/worker/src/deterministic/`; wire them into
+  `runDeterministicChecks` and `formatDeterministicForPrompt` so the agent sees their
+  results in its first turn.
