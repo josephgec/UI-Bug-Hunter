@@ -61,13 +61,16 @@ extension/
    non-zero if any finding meets the configured severity threshold.
 
 **LLM provider abstraction.** The agent loop talks through a provider-agnostic
-interface (`apps/worker/src/agent/llm.ts`). Three implementations ship:
+interface (`apps/worker/src/agent/llm.ts`). Four implementations ship:
 
 - `mock` — scripted, no network calls, useful for end-to-end smoke tests.
 - `anthropic` — Claude Messages API with vision + tool use.
 - `openai` — Chat Completions with vision + function calls.
+- `ollama` — local inference against a self-hosted Ollama server. Requires a
+  vision + tool-calling model (see [Local inference with Ollama](#local-inference-with-ollama)).
 
-Switch with `LLM_PROVIDER=mock|anthropic|openai` and the matching API key.
+Switch with `LLM_PROVIDER=mock|anthropic|openai|ollama` and the matching API key
+(or `OLLAMA_URL` for the local path).
 
 **KMS abstraction.** Credential vault uses `LocalKmsProvider` (AES-256-GCM with a key
 derived from `KMS_LOCAL_KEY`) by default; an `AwsKmsProvider` stub is wired to the same
@@ -264,9 +267,10 @@ pnpm eval                                 # writes .eval-output/report.{json,txt
 |---|---|---|
 | `DATABASE_URL` | local docker | Postgres connection string |
 | `REDIS_URL` | `redis://localhost:6379` | Redis Streams queue |
-| `LLM_PROVIDER` | `mock` | `mock` / `anthropic` / `openai` |
+| `LLM_PROVIDER` | `mock` | `mock` / `anthropic` / `openai` / `ollama` |
 | `LLM_MODEL` | provider default | overrides provider's default model |
-| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | required for non-mock providers |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | required for non-mock cloud providers |
+| `OLLAMA_URL` | `http://localhost:11434` | base URL of the local Ollama server |
 | `BILLING_PROVIDER` | `mock` | `mock` / `stripe` |
 | `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` / `STRIPE_PRICE_TEAM` / `STRIPE_PRICE_BUSINESS` | — | required when `BILLING_PROVIDER=stripe` |
 | `KMS_PROVIDER` | `local` | `local` / `aws` |
@@ -282,6 +286,61 @@ pnpm eval                                 # writes .eval-output/report.{json,txt
 | `WORKER_CONCURRENCY` | `1` | scans per worker process |
 | `ARTIFACT_DIR` | `./.scan-artifacts` | local-disk screenshot store |
 | `WORKER_TRACE` | unset | set to `1` to emit JSON trace events for every tool call |
+
+---
+
+## Local inference with Ollama
+
+Run the agent against a self-hosted Ollama server instead of a paid API. The
+agent loop relies on **vision + tool calling** — pick a model that supports
+both, and pull it before starting the worker.
+
+### Recommended model by RAM tier
+
+The agent runs alongside Postgres, Redis, the worker, and a Chromium instance.
+Budget ~8 GB for everything else and pick a model that fits in the rest, with
+headroom for the 8 K context window.
+
+| Available RAM | Model | Approx. on-disk | Notes |
+|---|---|---|---|
+| 16 – 32 GB | `llama3.2-vision:11b` | 7 GB | Solid baseline, broad hardware support, fastest. |
+| 32 – 48 GB | `qwen2.5vl:32b` | 22 GB | Best speed/quality tradeoff. Strong tool calling and vision; ~15-25 tok/s on Apple Silicon. |
+| 48 – 64 GB | `qwen2.5vl:72b` *or* `llama3.2-vision:90b` | 45 / 50 GB | Quality close to mid-tier API models. Slower (~5-10 tok/s) but the per-finding precision pays off. |
+
+For UI bug hunting specifically, the agent spends most of its time looking at
+screenshots — vision quality matters more than raw token throughput. On a
+**64 GB Mac Studio** I'd start with `qwen2.5vl:32b` for everyday scans and
+graduate to `llama3.2-vision:90b` for hard-to-reproduce visual regressions.
+
+### Setup
+
+```bash
+# 1. Install Ollama (macOS)
+brew install ollama && brew services start ollama
+
+# 2. Pull a model
+ollama pull qwen2.5vl:32b
+
+# 3. Point the worker at it
+echo 'LLM_PROVIDER=ollama' >> .env
+echo 'LLM_MODEL=qwen2.5vl:32b' >> .env
+```
+
+The Ollama server listens on `http://localhost:11434` by default. Override
+with `OLLAMA_URL` if it's running elsewhere.
+
+### Caveats
+
+- **Speed.** A scan that takes ~30 s against the Anthropic API may take
+  several minutes locally. Tune `SCAN_MAX_WALL_TIME_MS` upward for big models.
+- **Tool-call reliability.** Smaller / older models sometimes emit tool calls
+  in malformed JSON. The agent loop tolerates a handful of bad-JSON tool
+  results per scan but precision will suffer compared to the cloud providers.
+- **Context window.** The provider sets `num_ctx=8192`. Long crawls with many
+  screenshots may overflow; truncate older history if you hit the cap.
+- **Pure-text models.** `llama3.1`, `mistral-nemo`, etc. accept tool calls but
+  silently ignore screenshots — useful for the agent's deterministic checks
+  but it won't catch visual bugs without vision.
 
 ---
 
