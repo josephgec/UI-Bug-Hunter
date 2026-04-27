@@ -18,6 +18,8 @@ import {
   formatDeterministicForPrompt,
   runDeterministicChecks,
 } from "./deterministic/index.js";
+import { dispatchFinding } from "./destinations/dispatcher.js";
+import { executeFlow } from "./flows/executor.js";
 import { loadAuthInjection } from "./security/credentials.js";
 import { buildToolRegistry } from "./tools/index.js";
 
@@ -37,10 +39,25 @@ export async function runScan(job: ScanJob, config: RunnerConfig): Promise<void>
   const session = new BrowserSession(job.viewports as Viewport[], auth);
   const startedAt = Date.now();
 
+  let flowFailedAt: number | null = null;
   try {
     await session.start();
     await session.gotoAll(job.url);
     await session.settleAll();
+
+    // Phase 3: if this scan is bound to a flow, run the steps before handing
+    // control to the agent. Findings produced after the flow are tagged with
+    // the last attempted step index so the dashboard can show "broken on
+    // step 3".
+    if (job.flowId) {
+      const flow = await prisma.flow.findUnique({ where: { id: job.flowId } });
+      if (flow) {
+        const flowResult = await executeFlow(session, { steps: flow.steps as unknown }, {
+          strictAssertions: flow.strictAssertions,
+        });
+        flowFailedAt = flowResult.failedAt;
+      }
+    }
 
     const origin = new URL(job.url).origin;
     const deterministic = await runDeterministicChecks(session, origin);
@@ -115,7 +132,7 @@ export async function runScan(job: ScanJob, config: RunnerConfig): Promise<void>
       }))
       .filter((bug) => !existingHashes.has(bug.dedupHash));
 
-    await prisma.$transaction([
+    const created = await prisma.$transaction([
       ...findingRows.map((bug) =>
         prisma.finding.create({
           data: {
@@ -130,6 +147,7 @@ export async function runScan(job: ScanJob, config: RunnerConfig): Promise<void>
             ...(bug.domSnippet !== undefined ? { domSnippet: bug.domSnippet } : {}),
             reproductionSteps: bug.reproductionSteps,
             dedupHash: bug.dedupHash,
+            ...(flowFailedAt !== null ? { flowStepIndex: flowFailedAt } : {}),
           },
         }),
       ),
@@ -143,6 +161,16 @@ export async function runScan(job: ScanJob, config: RunnerConfig): Promise<void>
         },
       }),
     ]);
+
+    // Fire-and-forget dispatch to configured destinations. Failures are logged
+    // and stored on DestinationDispatch but do not fail the scan.
+    for (const finding of created) {
+      if ("category" in finding) {
+        void dispatchFinding(finding.id, job.projectId).catch((err) => {
+          console.error(`[scan ${job.scanId}] dispatch failed:`, err);
+        });
+      }
+    }
 
     console.log(
       `[scan ${job.scanId}] done in ${Date.now() - startedAt}ms — ${findingRows.length} findings (${session.reportedBugs.length - findingRows.length} dedup'd), ${result.toolCalls} tool calls (${result.endedReason})`,

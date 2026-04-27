@@ -1,0 +1,102 @@
+# UI Bug Hunter — GitLab CI template.
+# Usage: include this in your .gitlab-ci.yml and override the variables.
+#
+# include:
+#   - remote: 'https://raw.githubusercontent.com/josephgec/UI-Bug-Hunter/main/ci/gitlab/template.gitlab-ci.yml'
+# variables:
+#   UBH_PROJECT_ID: "your-project-id"
+#   UBH_URLS: |
+#     https://staging.example.com/
+#     https://staging.example.com/checkout
+#   UBH_VIEWPORTS: "mobile,tablet,desktop"
+#   UBH_SEVERITY_THRESHOLD: "high"
+#   # UBH_TOKEN must be set as a masked CI variable.
+
+ui-bug-hunter:scan:
+  stage: test
+  image: node:20-alpine
+  variables:
+    UBH_API_URL: "https://api.uibughunter.dev"
+    UBH_VIEWPORTS: "desktop"
+    UBH_SEVERITY_THRESHOLD: "high"
+    UBH_MIN_CONFIDENCE: "0.6"
+    UBH_OVERAGE_BEHAVIOR: "hard-fail"
+    UBH_POLL_TIMEOUT_SECONDS: "300"
+  before_script:
+    - apk add --no-cache jq curl
+  script:
+    - |
+      set -euo pipefail
+
+      if [ -z "${UBH_TOKEN:-}" ] || [ -z "${UBH_PROJECT_ID:-}" ] || [ -z "${UBH_URLS:-}" ]; then
+        echo "UBH_TOKEN, UBH_PROJECT_ID, and UBH_URLS are required." >&2
+        exit 2
+      fi
+
+      echo "▸ Submitting scans against ${UBH_API_URL}"
+
+      VIEWPORTS_JSON="$(printf '%s' "${UBH_VIEWPORTS}" | jq -R 'split(",")')"
+      scan_ids=()
+
+      while IFS= read -r url; do
+        [ -z "${url}" ] && continue
+        body="$(jq -n \
+          --arg projectId "${UBH_PROJECT_ID}" \
+          --arg url "${url}" \
+          --argjson viewports "${VIEWPORTS_JSON}" \
+          '{projectId:$projectId, url:$url, viewports:$viewports}')"
+        response="$(curl -fsS -X POST "${UBH_API_URL}/api/v1/scans" \
+          -H "authorization: Bearer ${UBH_TOKEN}" \
+          -H "content-type: application/json" \
+          -d "${body}" || echo "")"
+        if [ -z "${response}" ]; then
+          if [ "${UBH_OVERAGE_BEHAVIOR}" = "hard-fail" ]; then
+            echo "Failed to submit scan for ${url}" >&2
+            exit 1
+          else
+            continue
+          fi
+        fi
+        scan_id="$(printf '%s' "${response}" | jq -r '.scanId')"
+        scan_ids+=("${scan_id}")
+        echo "  submitted ${scan_id} for ${url}"
+      done <<< "${UBH_URLS}"
+
+      deadline=$(( $(date +%s) + UBH_POLL_TIMEOUT_SECONDS ))
+      failed=0
+      results_summary=""
+
+      for scan_id in "${scan_ids[@]}"; do
+        while true; do
+          if [ "$(date +%s)" -gt "${deadline}" ]; then
+            echo "Polling timed out for ${scan_id}" >&2
+            break
+          fi
+          status="$(curl -fsS "${UBH_API_URL}/api/v1/scans/${scan_id}" \
+            -H "authorization: Bearer ${UBH_TOKEN}" | jq -r '.status')"
+          if [ "${status}" = "COMPLETED" ] || [ "${status}" = "FAILED" ]; then
+            break
+          fi
+          sleep 5
+        done
+
+        findings_json="$(curl -fsS "${UBH_API_URL}/api/v1/scans/${scan_id}/findings?min_confidence=${UBH_MIN_CONFIDENCE}" \
+          -H "authorization: Bearer ${UBH_TOKEN}")"
+        flagged="$(printf '%s' "${findings_json}" | jq --arg t "${UBH_SEVERITY_THRESHOLD}" '
+          .findings | map(select(
+            ($t == "low") or
+            ($t == "medium" and (.severity == "medium" or .severity == "high" or .severity == "critical")) or
+            ($t == "high"   and (.severity == "high"   or .severity == "critical")) or
+            ($t == "critical" and .severity == "critical")
+          )) | length')"
+        echo "  scan ${scan_id}: ${flagged} finding(s) at or above ${UBH_SEVERITY_THRESHOLD}"
+        results_summary="${results_summary}\n  - ${scan_id}: ${flagged} flagged"
+        failed=$(( failed + flagged ))
+      done
+
+      if [ "${failed}" -gt 0 ]; then
+        echo -e "\nUI Bug Hunter found ${failed} finding(s) at or above ${UBH_SEVERITY_THRESHOLD}.\n${results_summary}" >&2
+        exit 1
+      fi
+  rules:
+    - if: '$CI_MERGE_REQUEST_IID || $CI_COMMIT_BRANCH'

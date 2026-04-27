@@ -17,6 +17,7 @@ export default defineConfig({
       include: [
         "packages/shared/src/**/*.ts",
         "apps/worker/src/**/*.ts",
+        "apps/web/src/sso/**/*.ts",
         "packages/eval/src/scoring.ts",
         "actions/scan/src/format.ts",
       ],
@@ -29,8 +30,15 @@ export default defineConfig({
         "apps/worker/src/browser.ts", // requires Playwright
         "apps/worker/src/crawler.ts", // requires Playwright
         "apps/worker/src/deterministic/**", // requires Playwright
+        "apps/worker/src/flows/**", // requires Playwright
+        "apps/worker/src/destinations/dispatcher.ts", // requires Prisma at runtime; logic surface tested via autoDispatchAllowed
+        "apps/worker/src/destinations/slack.ts", // requires Slack; integration-tested
+        "apps/worker/src/destinations/linear.ts", // requires Linear
+        "apps/worker/src/destinations/jira.ts", // requires Jira
         "apps/worker/src/security/credentials.ts", // requires Prisma at runtime
         "apps/worker/src/artifacts.ts", // thin disk wrapper
+        "apps/web/src/sso/mock.ts", // mock helper
+        "apps/web/src/sso/workos.ts", // requires WorkOS keys
       ],
       thresholds: {
         lines: 70,

@@ -53,6 +53,9 @@ export const ScanJobSchema = z.object({
   crawlId: z.string().optional(),
   parentScanId: z.string().optional(),
   depth: z.number().int().min(0).default(0),
+  // Phase 3: when set, the worker pulls the Flow definition from the DB and
+  // runs the steps before handing control to the agent.
+  flowId: z.string().optional(),
   // Encrypted credential references the worker should decrypt and inject.
   credentialIds: z.array(z.string()).default([]),
 });

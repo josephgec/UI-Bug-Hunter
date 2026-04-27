@@ -1,0 +1,103 @@
+# UI Bug Hunter — CircleCI orb.
+# Publish with: circleci orb publish ./orb.yml ubh/scan@dev:first
+#
+# Usage:
+#   version: 2.1
+#   orbs:
+#     ubh: ubh/scan@1
+#   workflows:
+#     test:
+#       jobs:
+#         - ubh/scan:
+#             api-token: $UBH_TOKEN
+#             project-id: $UBH_PROJECT_ID
+#             urls: "https://staging.example.com/\nhttps://staging.example.com/checkout"
+#             viewports: "mobile,tablet,desktop"
+#             severity-threshold: high
+version: 2.1
+description: |
+  Submit URLs to UI Bug Hunter and gate the build on findings.
+  See https://github.com/josephgec/UI-Bug-Hunter for details.
+
+display:
+  source_url: "https://github.com/josephgec/UI-Bug-Hunter"
+
+commands:
+  scan:
+    description: "Submit URLs to UI Bug Hunter and fail on threshold-breaching findings."
+    parameters:
+      api-url:
+        type: string
+        default: "https://api.uibughunter.dev"
+      api-token:
+        type: env_var_name
+        default: UBH_TOKEN
+      project-id:
+        type: string
+      urls:
+        type: string
+      viewports:
+        type: string
+        default: "desktop"
+      severity-threshold:
+        type: enum
+        enum: [critical, high, medium, low]
+        default: high
+      min-confidence:
+        type: string
+        default: "0.6"
+      poll-timeout-seconds:
+        type: integer
+        default: 300
+      overage-behavior:
+        type: enum
+        enum: [hard-fail, soft-fail, continue]
+        default: hard-fail
+    steps:
+      - run:
+          name: "Run UI Bug Hunter"
+          environment:
+            UBH_API_URL: << parameters.api-url >>
+            UBH_PROJECT_ID: << parameters.project-id >>
+            UBH_URLS: << parameters.urls >>
+            UBH_VIEWPORTS: << parameters.viewports >>
+            UBH_SEVERITY_THRESHOLD: << parameters.severity-threshold >>
+            UBH_MIN_CONFIDENCE: << parameters.min-confidence >>
+            UBH_POLL_TIMEOUT_SECONDS: << parameters.poll-timeout-seconds >>
+            UBH_OVERAGE_BEHAVIOR: << parameters.overage-behavior >>
+          command: |
+            set -euo pipefail
+            export UBH_TOKEN="${<< parameters.api-token >>}"
+            curl -fsSL https://raw.githubusercontent.com/josephgec/UI-Bug-Hunter/main/ci/scripts/ubh-scan.sh -o /tmp/ubh-scan.sh
+            bash /tmp/ubh-scan.sh
+
+jobs:
+  scan:
+    parameters:
+      api-url:
+        type: string
+        default: "https://api.uibughunter.dev"
+      api-token:
+        type: env_var_name
+        default: UBH_TOKEN
+      project-id:
+        type: string
+      urls:
+        type: string
+      viewports:
+        type: string
+        default: "desktop"
+      severity-threshold:
+        type: enum
+        enum: [critical, high, medium, low]
+        default: high
+    docker:
+      - image: cimg/node:20.10
+    steps:
+      - scan:
+          api-url: << parameters.api-url >>
+          api-token: << parameters.api-token >>
+          project-id: << parameters.project-id >>
+          urls: << parameters.urls >>
+          viewports: << parameters.viewports >>
+          severity-threshold: << parameters.severity-threshold >>

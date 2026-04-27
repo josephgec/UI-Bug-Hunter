@@ -4,13 +4,15 @@ AI agent that drives a headless browser, captures multimodal evidence (screensho
 console logs, network activity), and reports a categorized list of UI bugs found on a page.
 
 This repository tracks the design doc's phased rollout. **Phase 1 (MVP)** stood up the agent
-loop, schema, queue, deterministic checks, and eval harness. **Phase 2 (Beta — in progress)**
-layers on multi-viewport rendering, multi-page crawling, the full bug taxonomy, billing,
-encrypted credentials for authenticated scans, and a GitHub Action.
+loop, schema, queue, deterministic checks, and eval harness. **Phase 2 (Beta)** added
+multi-viewport rendering, multi-page crawling, billing, encrypted credentials, and a GitHub
+Action. **Phase 3 (GA)** layers on multi-step flows, destinations (Slack / Linear / Jira /
+generic webhook), audit log + RBAC, SSO via WorkOS, org-level aggregations, and templates
+for GitLab / CircleCI / Bitbucket on top of the existing GitHub Action.
 
-Items planned for Phase 2 that need infrastructure I don't have access to in this codebase
-(live Stripe, real KMS, deployed staging, marketing site, status page, real load test at
-100 concurrent scans) are abstracted behind interfaces with mock implementations — production
+Things that need infrastructure not in this codebase (live Stripe, real KMS, real WorkOS,
+deployed staging, marketing site, multi-region browser pool, on-call rotation, real load
+test at 10× peak) are abstracted behind interfaces with mock implementations — production
 swaps the implementation without touching callers.
 
 ---
@@ -20,13 +22,20 @@ swaps the implementation without touching callers.
 ```
 apps/
   web/           Next.js (App Router) dashboard + REST API
-  worker/        Queue consumer, Playwright multi-viewport sessions, agent loop
+  worker/        Queue consumer, Playwright multi-viewport sessions, agent loop, flow executor, destinations
 packages/
   db/            Prisma schema (Postgres) + client
-  shared/        Cross-package types, queue, URL validator, KMS, billing, dedup, crawl
+  shared/        Cross-package types, queue, URL validator, KMS, billing, dedup, crawl, flows, RBAC, audit, aggregations
   eval/          Eval harness, fixtures, synthetic injection, scoring
 actions/
   scan/          GitHub Action that submits scans + posts a PR comment
+ci/
+  gitlab/        GitLab CI template
+  circleci/      CircleCI orb
+  bitbucket/     Bitbucket Pipelines example
+  scripts/       Shared bash scan runner used by all three
+extension/
+  recorder/      Browser extension (Chrome MV3) that records click/type/wait into the Flow JSON format
 ```
 
 **Request lifecycle (Phase 2)**
@@ -119,9 +128,38 @@ curl -s -X POST http://localhost:3000/api/v1/projects/<projectId>/credentials \
   -H 'content-type: application/json' \
   -H 'x-dev-user: dev@local.test' \
   -d '{"name":"staging-cookie","kind":"COOKIE","data":{"name":"sid","value":"abc","domain":"staging.example.com"}}' | jq
+
+# Multi-step flow (login → checkout)
+curl -s -X POST http://localhost:3000/api/v1/flows \
+  -H 'content-type: application/json' \
+  -H 'x-dev-user: dev@local.test' \
+  -d '{
+    "projectId": "<id>",
+    "name": "Login + Checkout",
+    "definition": {
+      "steps": [
+        {"kind":"goto","url":"https://staging.example.com/login"},
+        {"kind":"type","selector":"input#email","text":"{{credentials.user}}"},
+        {"kind":"type","selector":"input#password","text":"{{credentials.pass}}"},
+        {"kind":"click","selector":"button[type=submit]","postWaitMs":500},
+        {"kind":"wait","selector":"[data-testid=dashboard]","state":"visible"},
+        {"kind":"goto","url":"https://staging.example.com/checkout"},
+        {"kind":"assert","urlMatches":"/checkout"}
+      ]
+    },
+    "credentialIds": ["<credentialId>"]
+  }' | jq
+
+# Run that flow
+curl -s -X POST http://localhost:3000/api/v1/flows/<flowId>/runs \
+  -H 'content-type: application/json' \
+  -H 'x-dev-user: dev@local.test' \
+  -d '{"url":"https://staging.example.com/checkout","viewports":["desktop"]}' | jq
 ```
 
-### GitHub Action
+### CI integrations
+
+**GitHub Action** (`actions/scan/`):
 
 ```yaml
 - uses: josephgec/UI-Bug-Hunter/actions/scan@main
@@ -138,26 +176,55 @@ curl -s -X POST http://localhost:3000/api/v1/projects/<projectId>/credentials \
     overage-behavior: hard-fail
 ```
 
-Build it locally (the bundled output lives under `actions/scan/dist/`):
+**GitLab CI**:
+
+```yaml
+include:
+  - remote: 'https://raw.githubusercontent.com/josephgec/UI-Bug-Hunter/main/ci/gitlab/template.gitlab-ci.yml'
+variables:
+  UBH_PROJECT_ID: $UBH_PROJECT_ID
+  UBH_URLS: |
+    https://staging.example.com/
+    https://staging.example.com/checkout
+  UBH_VIEWPORTS: "mobile,tablet,desktop"
+  UBH_SEVERITY_THRESHOLD: "high"
+```
+
+**CircleCI orb** (`ci/circleci/orb.yml`) and **Bitbucket Pipelines example**
+(`ci/bitbucket/bitbucket-pipelines.yml.example`) follow the same pattern; all
+three CI providers share a single bash runner at `ci/scripts/ubh-scan.sh`.
+
+**Generic webhook** (`POST /api/v1/integrations/webhook`) accepts a batch of
+`{projectId, url}` pairs from any CI system and returns the scan IDs to poll.
+
+Build the GitHub Action's bundled output locally:
 
 ```bash
 pnpm --filter @ubh/action-scan build
 ```
+
+### Browser-extension flow recorder
+
+Phase 3 ships a Chrome MV3 extension under `extension/recorder/` that captures
+clicks, input, and navigation into the same Flow JSON format the API accepts.
+See `extension/recorder/README.md` for the local-install instructions.
 
 ---
 
 ## Testing
 
 ```bash
-pnpm test               # vitest run — 101 tests across 14 files
+pnpm test               # vitest run — 142 tests across 21 files
 pnpm test:watch         # vitest --watch
 pnpm test:coverage      # v8 coverage (lines / branches / funcs / statements)
 ```
 
 Coverage gates at 70% are enforced across the pure-logic surface; the latest run
-sits at **91.4% lines / 84.3% branches / 81.8% functions**. Browser-bound modules
-(`browser.ts`, `crawler.ts`, `deterministic/*`, `runner.ts`) are excluded from
-coverage and exercised by the eval harness instead.
+sits at **93.2% lines / 85.4% branches / 84.9% functions**. Browser-bound modules
+(`browser.ts`, `crawler.ts`, `deterministic/*`, `flows/*`, `runner.ts`) and
+provider modules that hit live third-party APIs (`destinations/{slack,linear,jira}.ts`,
+`sso/workos.ts`) are excluded from coverage and exercised by the eval harness +
+integration tests instead.
 
 What the suite covers:
 
@@ -175,6 +242,12 @@ What the suite covers:
 | `apps/worker/src/agent/providers/{mock,anthropic,openai}.test.ts` | Provider translators (request + response), stop-reason mapping, malformed-JSON tolerance |
 | `apps/worker/src/tools/registry.test.ts` | Registry shape, schema sanity, `report_bug` validation + side effect |
 | `actions/scan/src/format.test.ts` | PR-comment renderer: green / red summaries, top-5 inline + collapsed-by-category for the rest, dashboard links |
+| `packages/shared/src/flows.test.ts` | Flow JSON schema: realistic login flow, step-shape validation, wait/assert mutual-exclusion |
+| `packages/shared/src/rbac.test.ts` | Role × permission matrix, admin-only carve-outs (audit, sso, member.role_change), sorted-unique invariant |
+| `packages/shared/src/audit.test.ts` | Payload redactor: top-level + nested + array, case-insensitive keys, cycle safety, AUDIT_ACTIONS shape |
+| `packages/shared/src/aggregations.test.ts` | Cross-project aggregation, day/week bucketing with gap-filling, top-regression delta math |
+| `apps/worker/src/destinations/{dispatcher,webhook}.test.ts` | Routing rule (severity threshold), HMAC-signed webhook body, non-2xx error path |
+| `apps/web/src/sso/state.test.ts` | HMAC-signed SSO state token: round-trip, tamper rejection, wrong-secret rejection, fresh-nonce |
 
 ### Running the eval harness
 
@@ -199,6 +272,11 @@ pnpm eval                                 # writes .eval-output/report.{json,txt
 | `KMS_PROVIDER` | `local` | `local` / `aws` |
 | `KMS_LOCAL_KEY` | — | passphrase for the local AES-256-GCM provider; min 16 chars |
 | `AWS_KMS_KEY_ID` | — | required when `KMS_PROVIDER=aws` |
+| `SSO_PROVIDER` | `mock` | `mock` / `workos` |
+| `SSO_STATE_SECRET` | — | HMAC secret for the OAuth `state` token; min 32 bytes recommended |
+| `WORKOS_API_KEY` / `WORKOS_CLIENT_ID` | — | required when `SSO_PROVIDER=workos` |
+| `SLACK_PROVIDER` / `LINEAR_PROVIDER` / `JIRA_PROVIDER` | unset | set to `mock` to short-circuit external API calls in dev |
+| `PUBLIC_DASHBOARD_URL` | `http://localhost:3000` | dashboard base URL the dispatcher embeds in destination messages |
 | `SCAN_MAX_TOOL_CALLS` | `40` | hard stop in the agent loop |
 | `SCAN_MAX_WALL_TIME_MS` | `120000` | hard stop in the agent loop |
 | `WORKER_CONCURRENCY` | `1` | scans per worker process |
@@ -238,6 +316,33 @@ pnpm eval                                 # writes .eval-output/report.{json,txt
   threshold-breaching findings, configurable overage behavior (hard-fail / soft-fail /
   continue)
 
+### Phase 3
+- Multi-step flows: JSON `goto`/`click`/`type`/`wait`/`assert` schema in shared,
+  `executeFlow` in worker with strict-assertion mode, findings tagged with
+  `flowStepIndex`, `/v1/flows` CRUD + `/v1/flows/:id/runs` quota-billed submission,
+  credential substitution (`{{credentials.foo}}`) in type steps so plaintext never
+  lives in the stored Flow
+- Destinations: `Destination` + `DestinationDispatch` tables (KMS-encrypted config),
+  `dispatchFinding()` routes a finding to every eligible destination per project,
+  Slack / Linear / Jira / generic-webhook providers, `autoSeverity` threshold rule,
+  every dispatch persisted with external id + URL or error
+- RBAC: explicit per-role permission map (admin / member / viewer), `requirePermission`
+  middleware on mutation routes, deny-by-default; `OrgMembership` carries the role
+- Audit log: `AuditLog` table, `writeAudit()` helper with cycle-safe payload redactor,
+  paginated `/v1/audit-log` API
+- SSO: `SsoConnection` table, `SsoProvider` interface with `MockSsoProvider` (dev) and
+  `WorkOSSsoProvider` skeleton, HMAC-signed state token, `/v1/sso/initiate` +
+  `/v1/sso/callback` routes that provision users + memberships on first login
+- Org-level aggregations: `aggregateFindings` / `trendOverTime` / `topRegressions`
+  pure-logic reducers in shared, exposed via `/v1/orgs/:id/aggregations` and
+  `/v1/orgs/:id/trends` (day or week buckets with zero-fill)
+- CI providers: GitLab template (`ci/gitlab/`), CircleCI orb (`ci/circleci/`),
+  Bitbucket Pipelines example (`ci/bitbucket/`), shared `ubh-scan.sh` runner, generic
+  `/v1/integrations/webhook` fallback
+- Browser-extension recorder: Chrome MV3 manifest + content / background / popup
+  scripts under `extension/recorder/` that capture click / input / navigation into
+  the Flow JSON format
+
 ## What's not wired
 
 | Item | Reason | Status |
@@ -248,8 +353,13 @@ pnpm eval                                 # writes .eval-output/report.{json,txt
 | 50-page hand-curated eval set | Needs human curation | Synthetic + 7 fixtures shipped; runner ready for more |
 | Two-pass adversarial verification | Phase 2 week 5 | Confidence threshold only |
 | Marketing site, status page | Not code | n/a |
-| Load test at 100 concurrent scans | Needs cloud infra | n/a |
+| Load test at 100 / 10× concurrent scans | Needs cloud infra | n/a |
 | Onboarding flow tuned for first scan in 60s | Needs UX iteration | n/a |
+| Real WorkOS SSO | Needs WorkOS account | `SSO_PROVIDER=mock` works end-to-end; WorkOS path throws without env |
+| Real Slack / Linear / Jira | Needs OAuth apps + API tokens | `*_PROVIDER=mock` short-circuits external calls |
+| Multi-region browser-worker deployment | Needs cloud infra | n/a |
+| On-call rotation / PagerDuty | Operational, not code | n/a |
+| Browser-extension Web Store packaging | Submission process | Skeleton ships, load-unpacked works locally |
 
 ---
 

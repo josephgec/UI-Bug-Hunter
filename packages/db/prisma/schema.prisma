@@ -1,7 +1,8 @@
-// UI Bug Hunter — schema (Phase 2).
-// Phase 2 additions: Crawl (multi-page), Subscription (Stripe), Credential
-// (encrypted secrets for authenticated scans), multi-viewport on Scan, plan
-// + quota fields on Organization.
+// UI Bug Hunter — schema (Phase 3).
+// Phase 3 additions: Flow + FlowRun (multi-step user flows), Destination +
+// DestinationDispatch (Slack/Linear/Jira routing), AuditLog, OrgMembership +
+// Role (RBAC), SsoConnection (SAML/OIDC via WorkOS). Credential gains an
+// OAUTH_TOKEN kind with refresh metadata.
 
 generator client {
   provider = "prisma-client-js"
@@ -32,9 +33,35 @@ model Organization {
   quotaResetAt      DateTime  @default(now())
   createdAt          DateTime  @default(now())
 
-  projects     Project[]
-  users        User[]
-  subscription Subscription?
+  projects       Project[]
+  users          User[]
+  subscription   Subscription?
+  memberships    OrgMembership[]
+  ssoConnections SsoConnection[]
+  auditLog       AuditLog[]
+  destinations   Destination[]
+}
+
+enum Role {
+  admin
+  member
+  viewer
+}
+
+// Phase 3: explicit org membership table so we can carry per-user role and
+// later support multi-org users. The legacy User.orgId still points at the
+// "primary" org for back-compat.
+model OrgMembership {
+  id        String   @id @default(cuid())
+  orgId     String
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      Role     @default(member)
+  createdAt DateTime @default(now())
+
+  @@unique([orgId, userId])
+  @@index([userId])
 }
 
 model User {
@@ -44,9 +71,11 @@ model User {
   orgId String
   org   Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
-  feedback  Feedback[]
-  apiTokens ApiToken[]
-  createdAt DateTime   @default(now())
+  feedback    Feedback[]
+  apiTokens   ApiToken[]
+  memberships OrgMembership[]
+  auditLog    AuditLog[]
+  createdAt   DateTime   @default(now())
 }
 
 model ApiToken {
@@ -72,11 +101,37 @@ model Project {
   viewports String[] @default(["desktop"])
   createdAt DateTime @default(now())
 
-  scans       Scan[]
-  crawls      Crawl[]
-  credentials Credential[]
+  scans        Scan[]
+  crawls       Crawl[]
+  credentials  Credential[]
+  flows        Flow[]
+  destinations Destination[]
 
   @@index([orgId])
+}
+
+// Phase 3: multi-step flow definition. The steps array follows the JSON
+// shape defined in packages/shared/src/flows.ts. Flows are project-scoped
+// because most authentication / setup is per-project.
+model Flow {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  steps       Json
+  // List of credential ids to inject when running this flow. Resolved by the
+  // worker at run time, never stored in plaintext.
+  credentialIds String[] @default([])
+  // Whether the flow's success requires every step's assertions to pass.
+  // (Reserved for week-15 step-level assertions; runner exposes the bit.)
+  strictAssertions Boolean @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  scans Scan[]
+
+  @@index([projectId])
 }
 
 enum ScanStatus {
@@ -119,6 +174,8 @@ model Scan {
   project       Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
   crawlId       String?
   crawl         Crawl?     @relation(fields: [crawlId], references: [id], onDelete: SetNull)
+  flowId        String?
+  flow          Flow?      @relation(fields: [flowId], references: [id], onDelete: SetNull)
   parentScanId  String?
   depth         Int        @default(0)
   status        ScanStatus @default(QUEUED)
@@ -138,6 +195,7 @@ model Scan {
 
   @@index([projectId, status])
   @@index([crawlId])
+  @@index([flowId])
   @@index([status, createdAt])
 }
 
@@ -158,9 +216,13 @@ model Finding {
   // Used to dedup the same logical bug across pages/viewports of one crawl.
   // Computed as sha256(category + normalized(title) + normalized(domSnippet)).
   dedupHash         String?
+  // Phase 3: when this finding came out of a flow, which step (1-indexed)
+  // was on screen. Helps the dashboard surface "broken on step 3" context.
+  flowStepIndex     Int?
   createdAt         DateTime @default(now())
 
-  feedback Feedback[]
+  feedback   Feedback[]
+  dispatches DestinationDispatch[]
 
   @@index([scanId])
   @@index([scanId, category])
@@ -185,6 +247,7 @@ enum CredentialKind {
   HEADER
   COOKIE
   BASIC_AUTH
+  OAUTH_TOKEN
 }
 
 model Credential {
@@ -201,6 +264,10 @@ model Credential {
   keyId      String
   // 12-byte AES-GCM IV stored alongside; auth tag is appended to ciphertext.
   iv         Bytes
+  // OAUTH_TOKEN only: refresh metadata so the worker knows when to rotate.
+  // refreshAt is the planned rotation time (typically issuedAt + expiresIn -
+  // a 5-minute safety margin).
+  refreshAt  DateTime?
   createdAt  DateTime       @default(now())
   lastUsedAt DateTime?
 
@@ -220,4 +287,116 @@ model Subscription {
   cancelAt             DateTime?
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
+}
+
+// ── Phase 3: destinations ────────────────────────────────────────────────────
+
+enum DestinationKind {
+  SLACK
+  LINEAR
+  JIRA
+  WEBHOOK
+}
+
+model Destination {
+  id          String          @id @default(cuid())
+  orgId       String
+  org         Organization    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  projectId   String?
+  project     Project?        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  kind        DestinationKind
+  name        String
+  // KMS-encrypted JSON config. Shape depends on kind: SLACK { botToken,
+  // defaultChannel }; LINEAR { apiKey, teamId }; JIRA { baseUrl, email,
+  // apiToken, projectKey, issueType }; WEBHOOK { url, secret }.
+  ciphertext  Bytes
+  iv          Bytes
+  keyId       String
+  // Auto-issue rule: when set, findings at or above this severity are
+  // automatically dispatched to this destination. null = manual only.
+  autoSeverity String?
+  // Channel routing (SLACK only); per-severity overrides take precedence.
+  routingJson  Json?
+  enabled     Boolean         @default(true)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  dispatches DestinationDispatch[]
+
+  @@index([orgId])
+  @@index([projectId])
+}
+
+enum DispatchStatus {
+  QUEUED
+  SENT
+  FAILED
+  SKIPPED
+}
+
+model DestinationDispatch {
+  id            String         @id @default(cuid())
+  destinationId String
+  destination   Destination    @relation(fields: [destinationId], references: [id], onDelete: Cascade)
+  findingId     String
+  finding       Finding        @relation(fields: [findingId], references: [id], onDelete: Cascade)
+  status        DispatchStatus @default(QUEUED)
+  externalId    String?        // Slack ts, Linear issue id, Jira key
+  externalUrl   String?
+  errorMessage  String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@unique([destinationId, findingId])
+  @@index([findingId])
+  @@index([status])
+}
+
+// ── Phase 3: audit log ──────────────────────────────────────────────────────
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  orgId     String
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  // Actor — user, or null for system actions (webhooks, cron).
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  // Stable verb (see packages/shared/src/audit.ts).
+  action    String
+  // What was operated on, e.g. "scan", "credential", "destination".
+  targetKind String?
+  targetId  String?
+  // Redacted JSON payload — the writer strips sensitive keys before logging.
+  payload   Json?
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([orgId, createdAt])
+  @@index([targetKind, targetId])
+}
+
+// ── Phase 3: SSO ────────────────────────────────────────────────────────────
+
+enum SsoProtocol {
+  SAML
+  OIDC
+}
+
+model SsoConnection {
+  id          String      @id @default(cuid())
+  orgId       String
+  org         Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  protocol    SsoProtocol
+  // External identifier from the SSO provider (e.g. WorkOS connection_id).
+  externalId  String      @unique
+  // KMS-encrypted config (idp metadata, client secret, etc.).
+  ciphertext  Bytes
+  iv          Bytes
+  keyId       String
+  domain      String?
+  enabled     Boolean     @default(true)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@index([orgId])
 }

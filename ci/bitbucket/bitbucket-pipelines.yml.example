@@ -1,0 +1,21 @@
+# UI Bug Hunter — Bitbucket Pipelines example.
+# Copy into bitbucket-pipelines.yml in your repo, then set the
+# UBH_TOKEN and UBH_PROJECT_ID repository variables (mark UBH_TOKEN as Secured).
+
+image: atlassian/default-image:4
+
+pipelines:
+  pull-requests:
+    '**':
+      - step:
+          name: UI Bug Hunter
+          script:
+            - apt-get update && apt-get install -y jq curl >/dev/null
+            - export UBH_API_URL="${UBH_API_URL:-https://api.uibughunter.dev}"
+            - export UBH_VIEWPORTS="${UBH_VIEWPORTS:-mobile,tablet,desktop}"
+            - export UBH_SEVERITY_THRESHOLD="${UBH_SEVERITY_THRESHOLD:-high}"
+            - export UBH_MIN_CONFIDENCE="${UBH_MIN_CONFIDENCE:-0.6}"
+            - export UBH_OVERAGE_BEHAVIOR="${UBH_OVERAGE_BEHAVIOR:-hard-fail}"
+            - export UBH_URLS="${UBH_URLS:-$(echo -e 'https://staging.example.com/\nhttps://staging.example.com/checkout')}"
+            - curl -fsSL https://raw.githubusercontent.com/josephgec/UI-Bug-Hunter/main/ci/scripts/ubh-scan.sh -o /tmp/ubh-scan.sh
+            - bash /tmp/ubh-scan.sh

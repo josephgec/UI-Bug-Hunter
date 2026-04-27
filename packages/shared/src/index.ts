@@ -6,3 +6,7 @@ export * from "./crawl.js";
 export * from "./billing.js";
 export * from "./dedup.js";
 export * from "./kms.js";
+export * from "./flows.js";
+export * from "./rbac.js";
+export * from "./audit.js";
+export * from "./aggregations.js";
